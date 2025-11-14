@@ -50,6 +50,60 @@
 
 static int run(struct iperf_test *test);
 
+static void
+parse_rate_sweep_args(struct iperf_test *test, int *argc, char ***argvp)
+{
+    int i;
+    int out = 1;
+    char **argv = *argvp;
+
+    if (!test || !test->settings) {
+        return;
+    }
+
+    test->settings->rate_sweep_enabled = 0;
+
+    for (i = 1; i < *argc; ++i) {
+        if (strcmp(argv[i], "--rate-sweep") == 0 && i + 1 < *argc) {
+            const char *arg = argv[i + 1];
+            unsigned long long start = 0, end = 0, step = 0;
+            double interval = 0.0;
+
+            /* 期望格式：start:end:step:interval，全是数字，单位：
+             *   start/end/step = bits per second
+             *   interval       = seconds (double)
+             */
+            if (sscanf(arg, "%llu:%llu:%llu:%lf",
+                       &start, &end, &step, &interval) != 4 ||
+                start == 0 || end == 0 || step == 0 || interval <= 0.0 ||
+                end < start) {
+                fprintf(stderr,
+                        "iperf3: bad --rate-sweep value '%s'\n"
+                        "Expected format: start:end:step:interval (bits/sec,seconds)\n",
+                        arg);
+                exit(1);
+            }
+
+            test->settings->rate_sweep_enabled   = 1;
+            test->settings->rate_sweep_start     = (iperf_size_t) start;
+            test->settings->rate_sweep_end       = (iperf_size_t) end;
+            test->settings->rate_sweep_step      = (iperf_size_t) step;
+            test->settings->rate_sweep_interval  = interval;
+
+            /* 初始化基础 rate 到起始速率（防止其他地方读取 settings->rate） */
+            test->settings->rate = (iperf_size_t) start;
+
+            /* 把这两个参数从 argv 删除掉，避免 getopt_long 报 unknown option */
+            i++; /* skip value */
+        } else {
+            argv[out++] = argv[i];
+        }
+    }
+
+    *argc = out;
+    argv[out] = NULL;
+}
+
 
 /**************************************************************************/
 int
@@ -113,6 +167,8 @@ main(int argc, char **argv)
     if (!test)
         iperf_errexit(NULL, "create new test error - %s", iperf_strerror(i_errno));
     iperf_defaults(test);	/* sets defaults */
+
+    parse_rate_sweep_args(test, &argc, &argv);
 
     if (iperf_parse_arguments(test, argc, argv) < 0) {
         iperf_err(test, "parameter error - %s", iperf_strerror(i_errno));

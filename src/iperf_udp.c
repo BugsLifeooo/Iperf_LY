@@ -212,6 +212,70 @@ iperf_udp_send(struct iperf_stream *sp)
 {
     int r;
     int       size = sp->settings->blksize;
+
+    struct iperf_test *test = sp->test;
+
+    /* 动态速率控制仅作用在 UDP 发送侧 & 开启了 rate_sweep 时 */
+    if (test->settings->rate_sweep_enabled && sp->sender) {
+        struct iperf_time now, diff;
+        int64_t elapsed_us;
+        int64_t want_interval_us;
+        iperf_size_t current_rate;
+
+        /* 首次初始化本 stream 的状态 */
+        if (!sp->rate_sweep_initialized) {
+            sp->rate_sweep_initialized = 1;
+            sp->rate_sweep_current = test->settings->rate_sweep_start;
+            iperf_time_now(&sp->rate_sweep_step_start);
+            iperf_time_now(&sp->last_send_time);
+        }
+
+        /* 检查是否到达下一个阶梯 */
+        iperf_time_now(&now);
+        iperf_time_diff(&now, &sp->rate_sweep_step_start, &diff);
+        elapsed_us = iperf_time_in_usecs(&diff);
+
+        if (elapsed_us >= (int64_t)(test->settings->rate_sweep_interval * SEC_TO_US)) {
+            iperf_size_t next_rate = sp->rate_sweep_current +
+                                     test->settings->rate_sweep_step;
+
+            if (next_rate > test->settings->rate_sweep_end) {
+                next_rate = test->settings->rate_sweep_end;
+            }
+
+            sp->rate_sweep_current = next_rate;
+            test->settings->rate   = next_rate;  /* 让其他地方看到最新速率 */
+
+            /* 重置阶梯计时 */
+            iperf_time_now(&sp->rate_sweep_step_start);
+        }
+
+        current_rate = sp->rate_sweep_current;
+
+        /* 计算理想发送间隔（基于当前速率、按每个数据包限速） */
+        if (current_rate > 0) {
+            /* bits -> microseconds：
+             * interval_us = (size * 8 / current_rate) 秒
+             */
+            want_interval_us =
+                (int64_t)((int64_t)size * 8 * 1000000LL / current_rate);
+
+            iperf_time_diff(&now, &sp->last_send_time, &diff);
+            elapsed_us = iperf_time_in_usecs(&diff);
+
+            if (elapsed_us < want_interval_us) {
+                int64_t sleep_us = want_interval_us - elapsed_us;
+                if (sleep_us > 0) {
+                    /* 简单 usleep 节流，避免发得太快 */
+                    usleep((useconds_t)sleep_us);
+                    iperf_time_now(&now);
+                }
+            }
+
+            sp->last_send_time = now;
+        }
+    }
+
     struct iperf_time before;
 
     iperf_time_now(&before);

@@ -156,7 +156,7 @@ struct iperf_stream_result
 
 #define COOKIE_SIZE 37		/* size of an ascii uuid */
 struct iperf_settings
-{
+{ 
     int       domain;               /* AF_INET or AF_INET6 */
     int       socket_bufsize;       /* window size for TCP */
     int       blksize;              /* size of read/writes (-l) */
@@ -191,6 +191,12 @@ struct iperf_settings
     int       cntl_ka_keepidle;     /* Control TCP connection Keepalive idle time (TCP_KEEPIDLE) */
     int       cntl_ka_interval;     /* Control TCP connection Keepalive interval between retries (TCP_KEEPINTV) */
     int       cntl_ka_count;        /* Control TCP connection Keepalive number of retries (TCP_KEEPCNT) */
+    /* Dynamic rate sweep configuration (client side, UDP only) */
+    int          rate_sweep_enabled;      /* 1 = enable rate sweep */
+    iperf_size_t rate_sweep_start;        /* starting rate (bits/sec) */
+    iperf_size_t rate_sweep_end;          /* maximum rate (bits/sec) */
+    iperf_size_t rate_sweep_step;         /* step per interval (bits/sec) */
+    double       rate_sweep_interval;     /* interval between steps (seconds) */
 };
 
 struct iperf_test;
@@ -253,6 +259,11 @@ struct iperf_stream
     SLIST_ENTRY(iperf_stream) streams;
 
     void     *data;
+    /* Dynamic rate sweep runtime state (per stream, UDP sender only) */
+    int           rate_sweep_initialized;
+    iperf_size_t  rate_sweep_current;        /* current target rate (bits/sec) */
+    struct iperf_time rate_sweep_step_start; /* last step change time */
+    struct iperf_time last_send_time;        /* last packet send time */
 };
 
 struct protocol {

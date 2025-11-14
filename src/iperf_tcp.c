@@ -97,6 +97,79 @@ iperf_tcp_send(struct iperf_stream *sp)
     if (!sp->pending_size)
 	      sp->pending_size = sp->settings->blksize;
 
+    struct iperf_test *test = sp->test;
+
+    /* 动态速率控制：TCP 发送侧 & 开启了 rate_sweep */
+    if (test->settings->rate_sweep_enabled && sp->sender) {
+        struct iperf_time now, diff;
+        int64_t elapsed_us;
+        int64_t want_interval_us;
+        iperf_size_t current_rate;
+
+        /* 首次初始化 */
+        if (!sp->rate_sweep_initialized) {
+            sp->rate_sweep_initialized = 1;
+            sp->rate_sweep_current = test->settings->rate_sweep_start;
+            iperf_time_now(&sp->rate_sweep_step_start);
+            iperf_time_now(&sp->last_send_time);
+
+#if defined(SO_MAX_PACING_RATE)
+            /* bytes/sec */
+            uint64_t pace = sp->rate_sweep_current / 8;
+            if (pace > 0) {
+                (void)setsockopt(sp->socket, SOL_SOCKET, SO_MAX_PACING_RATE,
+                                 &pace, sizeof(pace));
+            }
+#endif
+        }
+
+        /* 是否到达下一个阶梯 */
+        iperf_time_now(&now);
+        iperf_time_diff(&now, &sp->rate_sweep_step_start, &diff);
+        elapsed_us = iperf_time_in_usecs(&diff);
+
+        if (elapsed_us >= (int64_t)(test->settings->rate_sweep_interval * SEC_TO_US)) {
+            iperf_size_t next_rate = sp->rate_sweep_current +
+                                     test->settings->rate_sweep_step;
+            if (next_rate > test->settings->rate_sweep_end) {
+                next_rate = test->settings->rate_sweep_end;
+            }
+
+            if (next_rate != sp->rate_sweep_current) {
+                sp->rate_sweep_current = next_rate;
+                test->settings->rate   = next_rate; /* 让 reporter/JSON 等看到最新速率 */
+#if defined(SO_MAX_PACING_RATE)
+                uint64_t pace = next_rate / 8;
+                if (pace > 0) {
+                    (void)setsockopt(sp->socket, SOL_SOCKET, SO_MAX_PACING_RATE,
+                                     &pace, sizeof(pace));
+                }
+#endif
+            }
+            iperf_time_now(&sp->rate_sweep_step_start);
+        }
+
+        current_rate = sp->rate_sweep_current;
+
+        /* 简单应用层节流（按每个 write 的 size 估算） */
+        if (current_rate > 0) {
+            want_interval_us =
+                (int64_t)((int64_t)size * 8 * 1000000LL / current_rate);
+
+            iperf_time_diff(&now, &sp->last_send_time, &diff);
+            elapsed_us = iperf_time_in_usecs(&diff);
+
+            if (elapsed_us < want_interval_us) {
+                int64_t sleep_us = want_interval_us - elapsed_us;
+                if (sleep_us > 0) {
+                    usleep((useconds_t)sleep_us);
+                    iperf_time_now(&now);
+                }
+            }
+            sp->last_send_time = now;
+        }
+    }
+
     if (sp->test->zerocopy)
 	      r = Nsendfile(sp->buffer_fd, sp->socket, sp->buffer, sp->pending_size);
     else
