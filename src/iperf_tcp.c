@@ -94,6 +94,8 @@ iperf_tcp_send(struct iperf_stream *sp)
 {
     int r;
 
+    int       size = sp->settings->blksize;
+
     if (!sp->pending_size)
 	      sp->pending_size = sp->settings->blksize;
 
