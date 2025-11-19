@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <getopt.h>
 #include <errno.h>
 #include <signal.h>
@@ -50,12 +51,116 @@
 
 static int run(struct iperf_test *test);
 
+/* 解析带单位的速率字符串，返回 bit/s
+ * 支持格式示例：
+ *   "1000000"    -> 1000000 bit/s
+ *   "24KB"       -> 24 * 1024 * 8 bit/s
+ *   "0.2MB"      -> 0.2 * 1024^2 * 8 bit/s
+ *   "12M"        -> 12 * 1024^2 bit/s
+ *   "2GB"        -> 2 * 1024^3 * 8 bit/s
+ *
+ * 单位规则：
+ *   [K|M|G][B]   (大小写均可)
+ *   默认是 bits/s；带 B / b 时表示 Bytes/s，再 *8 变成 bits/s
+ */
+static iperf_size_t
+parse_rate_with_units(const char* s)
+{
+    double value;
+    char* end;
+    double scale = 1.0;
+    int is_bytes = 0;
+
+    if (s == NULL || *s == '\0')
+        return 0;
+
+    value = strtod(s, &end);
+    if (end == s) {
+        /* 没有解析出数字 */
+        return 0;
+    }
+
+    /* 跳过数字后面的空白 */
+    while (*end && isspace((unsigned char)*end))
+        end++;
+
+    if (*end != '\0') {
+        char unit = *end;
+
+        /* 处理 K / M / G 前缀 */
+        if (unit == 'k' || unit == 'K' ||
+            unit == 'm' || unit == 'M' ||
+            unit == 'g' || unit == 'G') {
+
+            switch (unit) {
+            case 'k': case 'K':
+                scale = 1024.0;
+                break;
+            case 'm': case 'M':
+                scale = 1024.0 * 1024.0;
+                break;
+            case 'g': case 'G':
+                scale = 1024.0 * 1024.0 * 1024.0;
+                break;
+            }
+
+            end++;
+
+            /* 可选 B / b，表示 Bytes */
+            if (*end == 'b' || *end == 'B') {
+                is_bytes = 1;
+                end++;
+            }
+        }
+        else if (*end == 'b' || *end == 'B') {
+            /* 只有 B / b，表示 Bytes */
+            is_bytes = 1;
+            end++;
+        }
+
+        /* 可选 "/s" 或 "ps" 之类，简单跳过 */
+        if (*end == '/') {
+            end++;
+            if (*end == 's' || *end == 'S')
+                end++;
+        }
+        else if (*end == 'p' || *end == 'P') {
+            end++;
+            if (*end == 's' || *end == 'S')
+                end++;
+        }
+
+        /* 再跳一次尾部空白 */
+        while (*end && isspace((unsigned char)*end))
+            end++;
+
+        /* 出现奇怪的多余字符，当作错误 */
+        if (*end != '\0') {
+            return 0;
+        }
+    }
+
+    if (is_bytes)
+        scale *= 8.0;   /* Bytes -> bits */
+
+    if (value <= 0.0)
+        return 0;
+
+    /* 转成 bit/s，四舍五入一下 */
+    double bits_per_sec = value * scale;
+    if (bits_per_sec <= 0.0)
+        return 0;
+
+    return (iperf_size_t)(bits_per_sec + 0.5);
+}
+
+
 static void
-parse_rate_sweep_args(struct iperf_test *test, int *argc, char ***argvp)
+parse_rate_sweep_args(struct iperf_test* test, int* argc, char*** argvp)
 {
     int i;
     int out = 1;
-    char **argv = *argvp;
+    char** argv = *argvp;
 
     if (!test || !test->settings) {
         return;
@@ -65,37 +170,67 @@ parse_rate_sweep_args(struct iperf_test *test, int *argc, char ***argvp)
 
     for (i = 1; i < *argc; ++i) {
         if (strcmp(argv[i], "--rate-sweep") == 0 && i + 1 < *argc) {
-            const char *arg = argv[i + 1];
-            unsigned long long start = 0, end = 0, step = 0;
+            const char* arg = argv[i + 1];
+            char buf[128];
+            char* saveptr = NULL;
+            char* tok;
+            const char* parts[4];
+            int n_parts = 0;
+            iperf_size_t start = 0, end = 0, step = 0;
             double interval = 0.0;
 
-            /* 期望格式：start:end:step:interval，全是数字，单位：
-             *   start/end/step = bits per second
-             *   interval       = seconds (double)
-             */
-            if (sscanf(arg, "%llu:%llu:%llu:%lf",
-                       &start, &end, &step, &interval) != 4 ||
-                start == 0 || end == 0 || step == 0 || interval <= 0.0 ||
-                end < start) {
+            if (!arg || strlen(arg) >= sizeof(buf)) {
                 fprintf(stderr,
-                        "iperf3: bad --rate-sweep value '%s'\n"
-                        "Expected format: start:end:step:interval (bits/sec,seconds)\n",
-                        arg);
+                    "iperf3: bad --rate-sweep value '%s'\n",
+                    arg ? arg : "(null)");
                 exit(1);
             }
 
-            test->settings->rate_sweep_enabled   = 1;
-            test->settings->rate_sweep_start     = (iperf_size_t) start;
-            test->settings->rate_sweep_end       = (iperf_size_t) end;
-            test->settings->rate_sweep_step      = (iperf_size_t) step;
-            test->settings->rate_sweep_interval  = interval;
+            strcpy(buf, arg);
 
-            /* 初始化基础 rate 到起始速率（防止其他地方读取 settings->rate） */
-            test->settings->rate = (iperf_size_t) start;
+            /* 按 ':' 拆成 4 段：start:end:step:interval */
+            tok = strtok_r(buf, ":", &saveptr);
+            while (tok && n_parts < 4) {
+                parts[n_parts++] = tok;
+                tok = strtok_r(NULL, ":", &saveptr);
+            }
 
-            /* 把这两个参数从 argv 删除掉，避免 getopt_long 报 unknown option */
+            if (n_parts != 4) {
+                fprintf(stderr,
+                    "iperf3: bad --rate-sweep value '%s'\n"
+                    "Expected format: start:end:step:interval\n",
+                    arg);
+                exit(1);
+            }
+
+            /* 前三段是速率，支持带单位；最后一段是秒 */
+            start = parse_rate_with_units(parts[0]);
+            end = parse_rate_with_units(parts[1]);
+            step = parse_rate_with_units(parts[2]);
+            interval = atof(parts[3]);
+
+            if (start == 0 || end == 0 || step == 0 || interval <= 0.0 || end < start) {
+                fprintf(stderr,
+                    "iperf3: bad --rate-sweep value '%s'\n"
+                    "  start/end/step: >0, 支持可选单位 K/M/G, KB/MB/GB (bit/s)\n"
+                    "  interval      : >0 (seconds)\n",
+                    arg);
+                exit(1);
+            }
+
+            test->settings->rate_sweep_enabled = 1;
+            test->settings->rate_sweep_start = start;
+            test->settings->rate_sweep_end = end;
+            test->settings->rate_sweep_step = step;
+            test->settings->rate_sweep_interval = interval;
+
+            /* 同步基础 rate，避免其它地方读 settings->rate 时还是旧值 */
+            test->settings->rate = start;
+
+            /* 把 '--rate-sweep' 这对参数从 argv 中“吃掉” */
             i++; /* skip value */
-        } else {
+        }
+        else {
             argv[out++] = argv[i];
         }
     }
@@ -103,6 +238,7 @@ parse_rate_sweep_args(struct iperf_test *test, int *argc, char ***argvp)
     *argc = out;
     argv[out] = NULL;
 }
+
 
 
 /**************************************************************************/
