@@ -197,6 +197,8 @@ struct iperf_settings
     iperf_size_t rate_sweep_end;          /* maximum rate (bits/sec) */
     iperf_size_t rate_sweep_step;         /* step per interval (bits/sec) */
     double       rate_sweep_interval;     /* interval between steps (seconds) */
+
+    int     rate_sweep_stabilize;    // ÎÈ¶¨ÆÚ£¨ºÁÃë£©
 };
 
 struct iperf_test;
