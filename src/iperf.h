@@ -209,6 +209,10 @@ struct iperf_stream
     int thread_created;
     int       done;
 
+    /* 速率步进平滑过渡相关字段 */
+    int rate_step_changed;           // 速率是否刚变化
+    int rate_adaptation_count;       // 适应计数器
+
     /* configurable members */
     int       local_port;
     int       remote_port;

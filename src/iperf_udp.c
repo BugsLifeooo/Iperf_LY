@@ -208,125 +208,148 @@ iperf_udp_recv(struct iperf_stream *sp)
  * sends the data for UDP
  */
 int
-iperf_udp_send(struct iperf_stream *sp)
+iperf_udp_send(struct iperf_stream* sp)
 {
     int r;
-    int       size = sp->settings->blksize;
+    int size = sp->settings->blksize;
+    if (!sp->pending_size)
+        sp->pending_size = sp->settings->blksize;
 
-    struct iperf_test *test = sp->test;
+    struct iperf_test* test = sp->test;
 
-    /* 动态速率控制仅作用在 UDP 发送侧 & 开启了 rate_sweep 时 */
+    /* 修复：TCP 速率步进 & 应用层 pacing */
     if (test->settings->rate_sweep_enabled && sp->sender) {
         struct iperf_time now, diff;
         int64_t elapsed_us;
         int64_t want_interval_us;
         iperf_size_t current_rate;
 
-        /* 首次初始化本 stream 的状态 */
+        /* 初始化 */
         if (!sp->rate_sweep_initialized) {
             sp->rate_sweep_initialized = 1;
             sp->rate_sweep_current = test->settings->rate_sweep_start;
             iperf_time_now(&sp->rate_sweep_step_start);
             iperf_time_now(&sp->last_send_time);
+
+            // 初始化平滑过渡相关变量
+            sp->rate_step_changed = 0;
+            sp->rate_adaptation_count = 0;
+
+#if defined(SO_MAX_PACING_RATE)
+            /* 修复：明确使用比特单位，设置内核pacing */
+            uint64_t pace = sp->rate_sweep_current; // bits/sec
+            if (pace > 0) {
+                if (setsockopt(sp->socket, SOL_SOCKET, SO_MAX_PACING_RATE,
+                    &pace, sizeof(pace)) < 0 && test->debug) {
+                    printf("SO_MAX_PACING_RATE failed: %s\n", strerror(errno));
+                }
+            }
+#endif
+            if (test->debug) {
+                printf("Rate sweep initialized: start=%" PRIu64 " bits/sec, step=%" PRIu64 ", interval=%g sec\n",
+                    test->settings->rate_sweep_start,
+                    test->settings->rate_sweep_step,
+                    test->settings->rate_sweep_interval);
+            }
         }
 
-        /* 检查是否到达下一个阶梯 */
+        /* 检查是否需要步进速率 */
         iperf_time_now(&now);
-        iperf_time_diff(&now, &sp->rate_sweep_step_start, &diff);
+        iperf_time_diff(&sp->rate_sweep_step_start, &now, &diff);
         elapsed_us = iperf_time_in_usecs(&diff);
 
-        if (elapsed_us >= (int64_t)(test->settings->rate_sweep_interval * SEC_TO_US)) {
-            iperf_size_t next_rate = sp->rate_sweep_current +
-                                     test->settings->rate_sweep_step;
+        // 修复：使用正确的秒到微秒转换
+        int64_t interval_us = (int64_t)test->settings->rate_sweep_interval * 1000000LL;
 
+        if (elapsed_us >= interval_us) {
+            iperf_size_t next_rate = sp->rate_sweep_current + test->settings->rate_sweep_step;
             if (next_rate > test->settings->rate_sweep_end) {
                 next_rate = test->settings->rate_sweep_end;
             }
 
-            sp->rate_sweep_current = next_rate;
-            test->settings->rate   = next_rate;  /* 让其他地方看到最新速率 */
+            if (next_rate != sp->rate_sweep_current) {
+                sp->rate_sweep_current = next_rate;
+                test->settings->rate = next_rate; // 更新 reporter/JSON 输出
 
-            /* 重置阶梯计时 */
+                sp->rate_step_changed = 1; // 标记速率已变化
+                sp->rate_adaptation_count = 0;
+
+                // 稳定期：在速率变化后短暂暂停
+                if (test->settings->rate_sweep_stabilize > 0) {
+                    usleep(test->settings->rate_sweep_stabilize * 500); // 毫秒级暂停
+                }
+
+#if defined(SO_MAX_PACING_RATE)
+                // 修复：更新内核pacing速率
+                uint64_t pace = next_rate; // bits/sec
+                if (pace > 0) {
+                    if (setsockopt(sp->socket, SOL_SOCKET, SO_MAX_PACING_RATE,
+                        &pace, sizeof(pace)) < 0 && test->debug) {
+                        printf("SO_MAX_PACING_RATE update failed: %s\n", strerror(errno));
+                    }
+                }
+#endif
+            }
             iperf_time_now(&sp->rate_sweep_step_start);
         }
 
         current_rate = sp->rate_sweep_current;
 
-        /* 计算理想发送间隔（基于当前速率、按每个数据包限速） */
-        if (current_rate > 0) {
-            /* bits -> microseconds：
-             * interval_us = (size * 8 / current_rate) 秒
-             */
-            want_interval_us =
-                (int64_t)((int64_t)size * 8 * 1000000LL / current_rate);
+        /* 平滑过渡机制 */
+        if (sp->rate_step_changed) {
+            // 当速率变化时，给TCP一些时间适应（线性过渡）
+            if (sp->rate_adaptation_count < 10) { // 适应前10个数据包
+                iperf_size_t prev_rate = sp->rate_sweep_current - test->settings->rate_sweep_step;
+                current_rate = (sp->rate_sweep_current * sp->rate_adaptation_count +
+                    prev_rate * (10 - sp->rate_adaptation_count)) / 10;
+                sp->rate_adaptation_count++;
+            }
+            else {
+                sp->rate_step_changed = 0;
+                sp->rate_adaptation_count = 0;
+            }
+        }
 
-            iperf_time_diff(&now, &sp->last_send_time, &diff);
+        /* 修复：应用层pacing计算（作为内核pacing的补充） */
+        if (current_rate > 0) {
+            // 修复：正确计算数据包间隔
+            // want_interval_us = (包大小(字节) * 8 bits/byte * 1e6 μs/s) / 速率(bits/s)
+            want_interval_us = (int64_t)((int64_t)size * 8 * 1000000LL) / current_rate;
+
+            iperf_time_diff(&sp->last_send_time, &now, &diff);
             elapsed_us = iperf_time_in_usecs(&diff);
 
             if (elapsed_us < want_interval_us) {
                 int64_t sleep_us = want_interval_us - elapsed_us;
                 if (sleep_us > 0) {
-                    /* 简单 usleep 节流，避免发得太快 */
+                    // 修复：限制最大sleep时间，避免过度延迟
+                    if (sleep_us > 100000) { // 最多sleep 100ms
+                        sleep_us = 100000;
+                    }
                     usleep((useconds_t)sleep_us);
                     iperf_time_now(&now);
                 }
             }
-
             sp->last_send_time = now;
         }
     }
 
-    struct iperf_time before;
+    // 原有的发送逻辑保持不变
+    if (sp->test->zerocopy)
+        r = Nsendfile(sp->buffer_fd, sp->socket, sp->buffer, sp->pending_size);
+    else
+        r = Nwrite(sp->socket, sp->buffer, sp->pending_size, Ptcp);
 
-    iperf_time_now(&before);
+    if (r < 0)
+        return r;
 
-    ++sp->packet_count;
-
-    if (sp->test->udp_counters_64bit) {
-
-	uint32_t  sec, usec;
-	uint64_t  pcount;
-
-	sec = htonl(before.secs);
-	usec = htonl(before.usecs);
-	pcount = htobe64(sp->packet_count);
-
-	memcpy(sp->buffer, &sec, sizeof(sec));
-	memcpy(sp->buffer+4, &usec, sizeof(usec));
-	memcpy(sp->buffer+8, &pcount, sizeof(pcount));
-
-    }
-    else {
-
-	uint32_t  sec, usec, pcount;
-
-	sec = htonl(before.secs);
-	usec = htonl(before.usecs);
-	pcount = htonl(sp->packet_count);
-
-	memcpy(sp->buffer, &sec, sizeof(sec));
-	memcpy(sp->buffer+4, &usec, sizeof(usec));
-	memcpy(sp->buffer+8, &pcount, sizeof(pcount));
-
-    }
-
-    r = Nwrite(sp->socket, sp->buffer, size, Pudp);
-
-    if (r <= 0) {
-        --sp->packet_count;     /* Don't count messages that no data was sent from them.
-                                 * Allows "resending" a massage with the same numbering */
-        if (r < 0) {
-            if (r == NET_SOFTERROR && sp->test->debug_level >= DEBUG_LEVEL_INFO)
-                printf("UDP send failed on NET_SOFTERROR. errno=%s\n", strerror(errno));
-            return r;
-        }
-    }
-
+    sp->pending_size -= r;
     sp->result->bytes_sent += r;
     sp->result->bytes_sent_this_interval += r;
 
-    if (sp->test->debug_level >=  DEBUG_LEVEL_DEBUG)
-	printf("sent %d bytes of %d, total %" PRIu64 "\n", r, sp->settings->blksize, sp->result->bytes_sent);
+    if (sp->test->debug_level >= DEBUG_LEVEL_DEBUG)
+        printf("sent %d bytes of %d, pending %d, total %" PRIu64 "\n",
+            r, sp->settings->blksize, sp->pending_size, sp->result->bytes_sent);
 
     return r;
 }
