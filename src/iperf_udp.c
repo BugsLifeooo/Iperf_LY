@@ -236,13 +236,14 @@ iperf_udp_send(struct iperf_stream* sp)
             sp->rate_adaptation_count = 0;
 
 #if defined(SO_MAX_PACING_RATE)
-            /* 修复：明确使用比特单位，设置内核pacing */
-            uint64_t pace = sp->rate_sweep_current; // bits/sec
-            if (pace > 0) {
-                if (setsockopt(sp->socket, SOL_SOCKET, SO_MAX_PACING_RATE,
-                    &pace, sizeof(pace)) < 0 && test->debug) {
-                    printf("SO_MAX_PACING_RATE failed: %s\n", strerror(errno));
-                }
+            // rate_sweep_current 是 bit/s，SO_MAX_PACING_RATE 要求 Byte/s
+            uint64_t pace = sp->rate_sweep_current / 8;
+            if (pace == 0 && sp->rate_sweep_current > 0)
+                pace = 1;
+
+            if (setsockopt(sp->socket, SOL_SOCKET, SO_MAX_PACING_RATE,
+                &pace, sizeof(pace)) < 0 && test->debug) {
+                printf("SO_MAX_PACING_RATE failed: %s\n", strerror(errno));
             }
 #endif
             if (test->debug) {
@@ -280,13 +281,14 @@ iperf_udp_send(struct iperf_stream* sp)
                 }
 
 #if defined(SO_MAX_PACING_RATE)
-                // 修复：更新内核pacing速率
-                uint64_t pace = next_rate; // bits/sec
-                if (pace > 0) {
-                    if (setsockopt(sp->socket, SOL_SOCKET, SO_MAX_PACING_RATE,
-                        &pace, sizeof(pace)) < 0 && test->debug) {
-                        printf("SO_MAX_PACING_RATE update failed: %s\n", strerror(errno));
-                    }
+                // rate_sweep_current 是 bit/s，SO_MAX_PACING_RATE 要求 Byte/s
+                uint64_t pace = sp->rate_sweep_current / 8;
+                if (pace == 0 && sp->rate_sweep_current > 0)
+                    pace = 1;
+
+                if (setsockopt(sp->socket, SOL_SOCKET, SO_MAX_PACING_RATE,
+                    &pace, sizeof(pace)) < 0 && test->debug) {
+                    printf("SO_MAX_PACING_RATE failed: %s\n", strerror(errno));
                 }
 #endif
             }
@@ -338,7 +340,7 @@ iperf_udp_send(struct iperf_stream* sp)
     if (sp->test->zerocopy)
         r = Nsendfile(sp->buffer_fd, sp->socket, sp->buffer, sp->pending_size);
     else
-        r = Nwrite(sp->socket, sp->buffer, sp->pending_size, Ptcp);
+        r = Nwrite(sp->socket, sp->buffer, sp->pending_size, Pudp);
 
     if (r < 0)
         return r;
