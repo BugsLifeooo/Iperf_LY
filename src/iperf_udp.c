@@ -203,40 +203,49 @@ iperf_udp_recv(struct iperf_stream *sp)
 }
 
 
+/* iperf_tcp_send 函数修复 */
+
 /* iperf_udp_send
  *
  * sends the data for UDP
  */
+ /* 在原始 iperf3 基础上，加入 rate_sweep 和 pacing 逻辑 */
 int
 iperf_udp_send(struct iperf_stream* sp)
 {
     int r;
     int size = sp->settings->blksize;
+    struct iperf_time before;
+    struct iperf_test* test = sp->test;
+
+    /* 保留原来对 pending_size 的处理（虽然 UDP 一般一次就发完整个块） */
     if (!sp->pending_size)
         sp->pending_size = sp->settings->blksize;
 
-    struct iperf_test* test = sp->test;
-
-    /* 修复：TCP 速率步进 & 应用层 pacing */
+    /**********************************************************************
+     * 1. rate_sweep + pacing 逻辑
+     *********************************************************************/
     if (test->settings->rate_sweep_enabled && sp->sender) {
         struct iperf_time now, diff;
         int64_t elapsed_us;
         int64_t want_interval_us;
         iperf_size_t current_rate;
 
-        /* 初始化 */
+        /* 初始化 rate_sweep 状态，只做一次 */
+        iperf_time_now(&now);
         if (!sp->rate_sweep_initialized) {
             sp->rate_sweep_initialized = 1;
             sp->rate_sweep_current = test->settings->rate_sweep_start;
-            iperf_time_now(&sp->rate_sweep_step_start);
-            iperf_time_now(&sp->last_send_time);
+            test->settings->rate = sp->rate_sweep_current;   /* 方便 reporter / JSON */
 
-            // 初始化平滑过渡相关变量
+            sp->rate_sweep_step_start = now;
+            sp->last_send_time = now;
+
             sp->rate_step_changed = 0;
             sp->rate_adaptation_count = 0;
 
 #if defined(SO_MAX_PACING_RATE)
-            // rate_sweep_current 是 bit/s，SO_MAX_PACING_RATE 要求 Byte/s
+            /* SO_MAX_PACING_RATE 用的是 Byte/s，这里把 bit/s 转一下 */
             uint64_t pace = sp->rate_sweep_current / 8;
             if (pace == 0 && sp->rate_sweep_current > 0)
                 pace = 1;
@@ -247,41 +256,35 @@ iperf_udp_send(struct iperf_stream* sp)
             }
 #endif
             if (test->debug) {
-                printf("Rate sweep initialized: start=%" PRIu64 " bits/sec, step=%" PRIu64 ", interval=%g sec\n",
+                printf("Rate sweep initialized: start=%" PRIu64 " bits/sec, "
+                    "step=%" PRIu64 ", interval=%g sec\n",
                     test->settings->rate_sweep_start,
                     test->settings->rate_sweep_step,
                     test->settings->rate_sweep_interval);
             }
         }
 
-        /* 检查是否需要步进速率 */
-        iperf_time_now(&now);
+        /* 是否到达下一个速率步进时间 */
         iperf_time_diff(&sp->rate_sweep_step_start, &now, &diff);
         elapsed_us = iperf_time_in_usecs(&diff);
 
-        // 修复：使用正确的秒到微秒转换
-        int64_t interval_us = (int64_t)test->settings->rate_sweep_interval * 1000000LL;
+        int64_t interval_us =
+            (int64_t)(test->settings->rate_sweep_interval * 1000000.0);
 
         if (elapsed_us >= interval_us) {
-            iperf_size_t next_rate = sp->rate_sweep_current + test->settings->rate_sweep_step;
-            if (next_rate > test->settings->rate_sweep_end) {
+            iperf_size_t next_rate =
+                sp->rate_sweep_current + test->settings->rate_sweep_step;
+            if (next_rate > test->settings->rate_sweep_end)
                 next_rate = test->settings->rate_sweep_end;
-            }
 
             if (next_rate != sp->rate_sweep_current) {
                 sp->rate_sweep_current = next_rate;
-                test->settings->rate = next_rate; // 更新 reporter/JSON 输出
+                test->settings->rate = next_rate;
 
-                sp->rate_step_changed = 1; // 标记速率已变化
+                sp->rate_step_changed = 1;
                 sp->rate_adaptation_count = 0;
 
-                // 稳定期：在速率变化后短暂暂停
-                if (test->settings->rate_sweep_stabilize > 0) {
-                    usleep(test->settings->rate_sweep_stabilize * 500); // 毫秒级暂停
-                }
-
 #if defined(SO_MAX_PACING_RATE)
-                // rate_sweep_current 是 bit/s，SO_MAX_PACING_RATE 要求 Byte/s
                 uint64_t pace = sp->rate_sweep_current / 8;
                 if (pace == 0 && sp->rate_sweep_current > 0)
                     pace = 1;
@@ -291,19 +294,26 @@ iperf_udp_send(struct iperf_stream* sp)
                     printf("SO_MAX_PACING_RATE failed: %s\n", strerror(errno));
                 }
 #endif
+                if (test->debug) {
+                    printf("Rate sweep step: new rate=%" PRIu64 " bits/sec\n",
+                        (uint64_t)sp->rate_sweep_current);
+                }
             }
+
             iperf_time_now(&sp->rate_sweep_step_start);
         }
 
+        /* 当前用于 pacing 的速率 */
         current_rate = sp->rate_sweep_current;
 
-        /* 平滑过渡机制 */
+        /* 简单做一个速率平滑（你原来也是类似思路） */
         if (sp->rate_step_changed) {
-            // 当速率变化时，给TCP一些时间适应（线性过渡）
-            if (sp->rate_adaptation_count < 10) { // 适应前10个数据包
-                iperf_size_t prev_rate = sp->rate_sweep_current - test->settings->rate_sweep_step;
-                current_rate = (sp->rate_sweep_current * sp->rate_adaptation_count +
-                    prev_rate * (10 - sp->rate_adaptation_count)) / 10;
+            if (sp->rate_adaptation_count < 10) {
+                iperf_size_t prev_rate =
+                    sp->rate_sweep_current - test->settings->rate_sweep_step;
+                current_rate =
+                    (sp->rate_sweep_current * sp->rate_adaptation_count +
+                        prev_rate * (10 - sp->rate_adaptation_count)) / 10;
                 sp->rate_adaptation_count++;
             }
             else {
@@ -312,46 +322,98 @@ iperf_udp_send(struct iperf_stream* sp)
             }
         }
 
-        /* 修复：应用层pacing计算（作为内核pacing的补充） */
+        /* 基于 current_rate 做发送间隔 pacing */
         if (current_rate > 0) {
-            // 修复：正确计算数据包间隔
-            // want_interval_us = (包大小(字节) * 8 bits/byte * 1e6 μs/s) / 速率(bits/s)
-            want_interval_us = (int64_t)((int64_t)size * 8 * 1000000LL) / current_rate;
+            /* want_interval_us = (包大小 * 8bit * 1e6) / (bit/s) */
+            want_interval_us =
+                (int64_t)size * 8 * 1000000LL / current_rate;
 
             iperf_time_diff(&sp->last_send_time, &now, &diff);
             elapsed_us = iperf_time_in_usecs(&diff);
 
             if (elapsed_us < want_interval_us) {
                 int64_t sleep_us = want_interval_us - elapsed_us;
+                if (sleep_us > 100000)      /* 最多 sleep 100ms，避免太长 */
+                    sleep_us = 100000;
+
                 if (sleep_us > 0) {
-                    // 修复：限制最大sleep时间，避免过度延迟
-                    if (sleep_us > 100000) { // 最多sleep 100ms
-                        sleep_us = 100000;
-                    }
                     usleep((useconds_t)sleep_us);
                     iperf_time_now(&now);
                 }
             }
+
             sp->last_send_time = now;
         }
     }
 
-    // 原有的发送逻辑保持不变
-    if (sp->test->zerocopy)
-        r = Nsendfile(sp->buffer_fd, sp->socket, sp->buffer, sp->pending_size);
-    else
-        r = Nwrite(sp->socket, sp->buffer, sp->pending_size, Pudp);
+    /**********************************************************************
+     * 2. 构造 UDP 报文头：时间戳 + 序号（和官方 iperf3 完全兼容）
+     *********************************************************************/
+    iperf_time_now(&before);
 
-    if (r < 0)
-        return r;
+    ++sp->packet_count;   /* 每个 UDP 报文一个递增序号 */
 
-    sp->pending_size -= r;
+    if (sp->test->udp_counters_64bit) {
+        uint32_t sec, usec;
+        uint64_t pcount;
+
+        sec = htonl(before.secs);
+        usec = htonl(before.usecs);
+        pcount = htobe64(sp->packet_count);
+
+        memcpy(sp->buffer, &sec, sizeof(sec));
+        memcpy(sp->buffer + 4, &usec, sizeof(usec));
+        memcpy(sp->buffer + 8, &pcount, sizeof(pcount));
+    }
+    else {
+        uint32_t sec, usec, pcount32;
+
+        sec = htonl(before.secs);
+        usec = htonl(before.usecs);
+        pcount32 = htonl((uint32_t)sp->packet_count);
+
+        memcpy(sp->buffer, &sec, sizeof(sec));
+        memcpy(sp->buffer + 4, &usec, sizeof(usec));
+        memcpy(sp->buffer + 8, &pcount32, sizeof(pcount32));
+    }
+
+    /**********************************************************************
+     * 3. 真正发送 UDP 报文
+     *
+     * 这里刻意不用 zerocopy（sendfile），只用 Nwrite，
+     * 保证我们刚写进去的头部就是要发出去的内容。
+     *********************************************************************/
+    r = Nwrite(sp->socket, sp->buffer, size, Pudp);
+
+    if (r <= 0) {
+        /* 这次没真正发出去，撤销刚刚 ++ 的那个序号 */
+        --sp->packet_count;
+
+        if (r < 0) {
+            if (r == NET_SOFTERROR &&
+                sp->test->debug_level >= DEBUG_LEVEL_INFO) {
+                printf("UDP send failed on NET_SOFTERROR. errno=%s\n",
+                    strerror(errno));
+            }
+            return r;
+        }
+
+        /* r == 0：没发任何东西，下面统计里加 0 也无所谓 */
+    }
+
+    /**********************************************************************
+     * 4. 更新统计
+     *********************************************************************/
     sp->result->bytes_sent += r;
     sp->result->bytes_sent_this_interval += r;
 
+    /* 你原来有 pending_size，就顺手减一下；对 UDP 来说一般等于 size */
+    sp->pending_size -= r;
+
     if (sp->test->debug_level >= DEBUG_LEVEL_DEBUG)
         printf("sent %d bytes of %d, pending %d, total %" PRIu64 "\n",
-            r, sp->settings->blksize, sp->pending_size, sp->result->bytes_sent);
+            r, sp->settings->blksize,
+            sp->pending_size, sp->result->bytes_sent);
 
     return r;
 }
